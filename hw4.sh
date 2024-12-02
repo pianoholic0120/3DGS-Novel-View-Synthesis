@@ -1,3 +1,6 @@
 #!/bin/bash
-python3 .py $1 $2
-# TODO - run your inference Python3 code
+
+SPLIT_FOLDER=$1
+OUTPUT_FOLDER=$2
+
+python3 ./gaussian-splatting/infer.py -m ./gaussian-splatting/output/setting_1/ -s "$SPLIT_FOLDER" --output_folder "$OUTPUT_FOLDER" --skip_test
