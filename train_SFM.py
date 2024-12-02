@@ -3,6 +3,7 @@ import gc
 import numpy as np
 import torch
 import math
+import json
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -44,10 +45,10 @@ def initialize_gaussians_from_points3d(filepath, sh_degree, device='cuda'):
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"SfM points file not found at {filepath}")
     xyz, colors = load_points3d(filepath)
-    # center = xyz.mean(axis=0)
-    # xyz -= center
-    # scale = np.percentile(np.linalg.norm(xyz, axis=1), 90)  
-    # xyz /= scale
+    center = xyz.mean(axis=0)
+    xyz -= center
+    scale = np.percentile(np.linalg.norm(xyz, axis=1), 90)  # Normalize by 90th percentile distance
+    xyz /= scale
     xyz_tensor = torch.tensor(xyz, dtype=torch.float32, device=device)
     colors_tensor = torch.clamp(torch.tensor(colors, dtype=torch.float32, device=device), 0.0, 1.0)
     n_points = xyz_tensor.shape[0]
@@ -84,7 +85,17 @@ def initialize_gaussians_from_points3d(filepath, sh_degree, device='cuda'):
     print(f"Total points: {n_points}")
     print(f"XYZ range: [{xyz_tensor.min()}, {xyz_tensor.max()}]")
     print(f"Color range: [{colors_tensor.min()}, {colors_tensor.max()}]")
-    return gaussians
+    return gaussians, center, scale
+
+def save_scene_config(path, center, scale, final=False):
+    config = {
+        "center": center.tolist(),
+        "scale": scale,
+        "final": final
+    }
+    with open(path, 'w') as f:
+        json.dump(config, f, indent=4)
+    print(f"Saved {'final' if final else 'initial'} scene configuration to {path}")
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
@@ -95,8 +106,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     sfm_points_path = '../dataset/train/sparse/0/points3D.ply'
     # gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    gaussians= initialize_gaussians_from_points3d(sfm_points_path, dataset.sh_degree)
+    gaussians, initial_center, initial_scale = initialize_gaussians_from_points3d(sfm_points_path, dataset.sh_degree)
+    print(f"Initial Center: {initial_center}\nInitial Scale: {initial_scale}\n")
+    config_path = os.path.join(dataset.model_path, "scene_config.json")
+    save_scene_config(config_path, initial_center, initial_scale)
+    camera_config_path = os.path.join(dataset.model_path, "camera_params.json")
     scene = Scene(dataset, gaussians)
+    cameras = scene.getTrainCameras() + scene.getTestCameras()
+    camera_data = [
+        {
+            "image_name": cam.image_name,
+            "rotation_matrix": cam.R.tolist(),
+            "translation": cam.T.tolist(),
+            "FoVx": cam.FoVx,
+            "FoVy": cam.FoVy,
+        }
+        for cam in cameras
+    ]
+    with open(camera_config_path, 'w') as f:
+        json.dump(camera_data, f, indent=4)
+    print(f"Saved scene configuration to {config_path}")
+    print(f"Saved camera configurations to {camera_config_path}")
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -232,6 +262,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+    with torch.no_grad():
+        final_xyz = gaussians._xyz.cpu().numpy()  # Get final point cloud positions
+        final_center = final_xyz.mean(axis=0)
+        final_scale = np.percentile(np.linalg.norm(final_xyz - final_center, axis=1), 90)
+    save_scene_config(config_path.replace(".json", "_final.json"), final_center, final_scale, final=True)
+    scene.save(iteration)
+    print(f"Training completed. Final Center: {final_center}, Final Scale: {final_scale}")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -300,10 +337,10 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
-    op.densify_from_iter = 100  
-    op.densify_until_iter = 100000  
-    op.densification_interval = 10  
-    op.densify_grad_threshold = 0.00001  
+    op.densify_from_iter = 50  
+    op.densify_until_iter = 200000  
+    op.densification_interval = 5  
+    op.densify_grad_threshold = 0.000001  
     pp = PipelineParams(parser)
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
